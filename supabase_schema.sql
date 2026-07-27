@@ -26,6 +26,9 @@ create table analysis_runs (
   research_sec real,
   analysis_sec real,
   total_sec real,
+  num_sources integer,
+  research_limited boolean,
+  num_failed_queries integer,
   started_at timestamptz not null default now(),
   completed_at timestamptz
 );
@@ -71,6 +74,14 @@ alter table analysis_runs disable row level security;
 alter table user_events disable row level security;
 alter table reports disable row level security;
 alter table error_logs disable row level security;
+
+-- ── Migration (v0.6) — run this if analysis_runs already exists ───────────────
+-- Adds research-quality columns for observability filtering (num_sources,
+-- research_limited, num_failed_queries). Safe to run once on an existing table;
+-- "if not exists" makes it a no-op if already applied.
+alter table analysis_runs add column if not exists num_sources integer;
+alter table analysis_runs add column if not exists research_limited boolean;
+alter table analysis_runs add column if not exists num_failed_queries integer;
 
 -- Indexes for common queries
 create index idx_analysis_runs_session on analysis_runs(session_id);

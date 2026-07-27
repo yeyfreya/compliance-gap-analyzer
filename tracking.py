@@ -120,6 +120,26 @@ def complete_run(
     _supabase_client.from_("analysis_runs").update(update).eq("id", run_id).execute()
 
 
+@_safe
+def update_run_research_quality(
+    run_id: str,
+    num_sources: int,
+    research_limited: bool,
+    num_failed_queries: int,
+) -> None:
+    """Save research-quality metrics onto the run row so they are queryable in SQL.
+
+    Kept as a SEPARATE update from complete_run() on purpose: if the new columns don't
+    exist yet (schema not migrated), only this call fails — timing/status stay intact.
+    Requires columns num_sources, research_limited, num_failed_queries on analysis_runs.
+    """
+    _supabase_client.from_("analysis_runs").update({
+        "num_sources": num_sources,
+        "research_limited": research_limited,
+        "num_failed_queries": num_failed_queries,
+    }).eq("id", run_id).execute()
+
+
 # ── User event tracking ──────────────────────────────────────────────────────
 
 @_safe

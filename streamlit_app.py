@@ -48,16 +48,20 @@ from opentelemetry import trace as otel_trace
 
 from agent import (
     plan_searches,
-    conduct_research,
+    gather_research,
     analyze_compliance,
     save_report,
     append_test_log,
+    score_research_quality,
+    EmptyResearchError,
+    MIN_ADEQUATE_RESULTS,
     TEST_SCENARIOS,
 )
 from tracking import (
     init_session,
     start_run,
     complete_run,
+    update_run_research_quality,
     log_user_event,
     save_report_to_db,
     log_error,
@@ -65,7 +69,7 @@ from tracking import (
     is_rate_limited,
 )
 
-VERSION = "v0.5"
+VERSION = "v0.6"
 _langfuse = get_langfuse_client()
 
 st.set_page_config(
@@ -251,12 +255,29 @@ def _run_pipeline(use_case, technology, industry, run_id, session_id, version):
 
             status.update(label="Running compliance analysis… (step 2/3)")
 
-            # Step 2 — Conduct research
+            # Step 2 — Conduct research (with lightweight adequacy retry — #7)
             st.write("🔬 **Conducting research** — searching the web for regulatory data…")
             t0 = time.time()
-            research_findings = conduct_research(search_queries)
+            research = gather_research(use_case, technology, industry, search_queries)
+            research_findings = research["findings_text"]
             time_research = round(time.time() - t0, 1)
-            st.write(f"✅ Research complete ({time_research}s)")
+
+            # #29 — refuse to generate a report from empty research
+            if research["num_results"] == 0:
+                status.update(label="Research unavailable", state="error", expanded=True)
+                raise EmptyResearchError("No research results were returned from any search.")
+
+            research_limited = 0 < research["num_results"] < MIN_ADEQUATE_RESULTS
+            limited_tag = " · limited data" if research_limited else ""
+            st.write(
+                f"✅ Research complete — {research['num_results']} sources "
+                f"({time_research}s){limited_tag}"
+            )
+
+            # Record research-quality scores on this run's Langfuse trace (filterable)
+            score_research_quality(
+                research["num_results"], research_limited, len(research["failed_queries"])
+            )
 
             status.update(label="Running compliance analysis… (step 3/3)")
 
@@ -283,6 +304,9 @@ def _run_pipeline(use_case, technology, industry, run_id, session_id, version):
         "industry": industry,
         "search_queries": search_queries,
         "analysis": analysis,
+        "sources": research["sources"],
+        "research_limited": research_limited,
+        "num_failed_queries": len(research["failed_queries"]),
         "timing": {
             "planning_sec": time_planning,
             "research_sec": time_research,
@@ -326,6 +350,7 @@ if run_btn:
     st.session_state.result = None
     st.session_state.report_md = None
     st.session_state.report_path = None
+    st.session_state.feedback_given = False
 
     scenario_source = chosen_key if chosen_key else "custom"
     run_id = start_run(session_id, use_case, technology, industry, scenario_source, VERSION)
@@ -346,22 +371,47 @@ if run_btn:
                       app_version=VERSION)
             report_path = None
 
+        # Build the FULL report markdown (includes the Sources section) once, up front,
+        # so both Supabase and the download button get the complete report — not just the
+        # analysis text. Falls back to the analysis if the local file save failed.
+        if report_path:
+            with open(report_path, "r", encoding="utf-8") as f:
+                report_md = f.read()
+        else:
+            report_md = result.get("analysis", "")
+
         if run_id:
             complete_run(run_id, result["timing"])
+            update_run_research_quality(
+                run_id,
+                len(result.get("sources", [])),
+                result.get("research_limited", False),
+                result.get("num_failed_queries", 0),
+            )
             if report_path:
-                save_report_to_db(run_id, result["analysis"], result["search_queries"],
+                save_report_to_db(run_id, report_md, result["search_queries"],
                                   os.path.basename(report_path))
             log_user_event(session_id, "report_viewed", run_id=run_id)
 
         st.session_state.result = result
         st.session_state.report_path = report_path
         st.session_state.current_run_id = run_id
+        st.session_state.report_md = report_md
 
-        if report_path:
-            with open(report_path, "r", encoding="utf-8") as f:
-                st.session_state.report_md = f.read()
-        else:
-            st.session_state.report_md = result.get("analysis", "")
+    except EmptyResearchError as research_err:
+        # #29 — research came back empty; we deliberately did NOT fabricate a report
+        log_error(research_err, session_id=session_id, run_id=run_id,
+                  pipeline_step="research", user_inputs=_user_inputs,
+                  app_version=VERSION)
+        if run_id:
+            mark_run_failed(run_id, research_err)
+
+        st.warning(
+            "The agent couldn't gather regulatory research just now — this is usually a "
+            "temporary web-search hiccup. Please try again in a moment."
+        )
+        st.caption(f"Reference: `{run_id or 'no-run-id'}`")
+        log_user_event(session_id, "research_failed", run_id=run_id)
 
     except Exception as pipeline_err:
         log_error(pipeline_err, session_id=session_id, run_id=run_id,
@@ -410,10 +460,29 @@ if result:
         unsafe_allow_html=True,
     )
 
-    tab_report, tab_queries = st.tabs(["📄 Report", "🔍 Search Queries"])
+    if result.get("research_limited"):
+        st.warning(
+            "This report was generated from limited research data — some searches returned "
+            "few results. Coverage may be incomplete; consider re-running for a fuller analysis."
+        )
+
+    tab_report, tab_sources, tab_queries = st.tabs(
+        ["📄 Report", "🔗 Sources", "🔍 Search Queries"]
+    )
 
     with tab_report:
         st.markdown(result["analysis"])
+
+    with tab_sources:
+        sources = result.get("sources", [])
+        if sources:
+            st.caption("Regulatory and policy sources the agent reviewed for this report.")
+            for i, s in enumerate(sources, 1):
+                title = s.get("title") or s.get("url") or "Untitled source"
+                url = s.get("url", "")
+                st.markdown(f"{i}. [{title}]({url})" if url else f"{i}. {title}")
+        else:
+            st.caption("No sources were captured for this report.")
 
     with tab_queries:
         for i, q in enumerate(result["search_queries"], 1):
@@ -441,6 +510,27 @@ if result:
     with col_path:
         if not st.session_state.report_path:
             st.caption("⚠️ Local save failed — report available via download only")
+
+    # ── Feedback (#31) ────────────────────────────────────────────────────────
+    st.divider()
+    run_id_for_fb = st.session_state.get("current_run_id")
+    if st.session_state.get("feedback_given"):
+        st.caption("✅ Thanks for your feedback — it helps improve the agent.")
+    else:
+        st.markdown("**Was this report helpful?**")
+        fb_yes, fb_no, _ = st.columns([1, 1, 6])
+        with fb_yes:
+            if st.button("👍 Yes", use_container_width=True):
+                log_user_event(st.session_state.supabase_session_id, "feedback",
+                               run_id=run_id_for_fb, event_data={"rating": "up"})
+                st.session_state.feedback_given = True
+                st.rerun()
+        with fb_no:
+            if st.button("👎 No", use_container_width=True):
+                log_user_event(st.session_state.supabase_session_id, "feedback",
+                               run_id=run_id_for_fb, event_data={"rating": "down"})
+                st.session_state.feedback_given = True
+                st.rerun()
 
 elif not run_btn:
     st.info(

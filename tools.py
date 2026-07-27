@@ -15,6 +15,7 @@ import os
 import time
 from tavily import TavilyClient
 from dotenv import load_dotenv
+from langfuse import observe  # records each search as its own step in Langfuse
 
 # Load environment variables
 load_dotenv()
@@ -25,6 +26,7 @@ tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
 
 #search_web() - Use Tavily to search the web for information
+@observe()
 def search_web(query: str, max_results: int = 3) -> dict:
     """
     Search the web for compliance-related information.

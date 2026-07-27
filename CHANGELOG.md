@@ -5,6 +5,38 @@ Each version represents an iteration, including what was analyzed, what changed,
 
 ---
 
+## [v0.6] - 2026-03-10 — Pipeline Hardening & Prompt Fixes
+
+### Summary
+Systematic fix of all remaining issues from the v0.5 backlog, prioritized by impact.
+HIGH: research failure surfacing, misleading system prompt, research adequacy loop.
+MEDIUM: report quality heuristics, user feedback, token reduction, source inclusion.
+
+### What Changed
+- **Research now returns structured data** (`agent.py`, `conduct_research()`): returns a dict
+  (findings text, sources, successful/failed queries, result count) instead of a flat string —
+  the foundation for the failure-surfacing, sources, and adequacy fixes below
+- **No reports from empty research** (`agent.py`, `streamlit_app.py`): new `EmptyResearchError`;
+  the pipeline aborts with a calm retry message instead of writing a fabricated report when no
+  searches return results. Thin-but-nonzero research is flagged with a limitations note (#29)
+- **Honest system prompt** (`prompts.py`): removed the false "you have access to web search
+  tools" claim; the prompt now accurately describes that findings are supplied to Claude, and
+  instructs it to flag thin findings rather than invent specifics (#9)
+- **Research adequacy check** (`agent.py`, `gather_research()`): if the first research pass is
+  thin (< 4 results), one broadened supplementary search round runs and merges (dedup by URL).
+  Lightweight heuristic; full agentic loop deferred to v0.7 (#7)
+- **Sources in the report** (`agent.py` `save_report()`, `streamlit_app.py`): reports gain a
+  "Sources" section (markdown links); the UI gains a "🔗 Sources" tab (#14)
+- **Feedback button** (`streamlit_app.py`): 👍/👎 "Was this report helpful?" under each report,
+  stored in the existing `user_events` table — no schema migration (#31)
+
+Deferred as planned: #30 (quality heuristics), #13 (research preprocessing), and LOW items
+(#8, #23, #24, #25, #32).
+
+Full details: [docs/iterations/v0.6-pipeline-hardening-and-prompt-fixes.md](docs/iterations/v0.6-pipeline-hardening-and-prompt-fixes.md)
+
+---
+
 ## [v0.5.1] - 2026-03-01 — README, Repo Cleanup & Architecture Doc
 
 ### Summary

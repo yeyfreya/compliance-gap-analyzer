@@ -27,6 +27,14 @@ AnthropicInstrumentor().instrument()
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 
+class EmptyResearchError(Exception):
+    """Raised when research returns zero results.
+
+    Signals that we must NOT ask Claude to write a report, because a report built on
+    no research would be fabricated (#29). Callers decide how to surface this.
+    """
+
+
 def _retry_api_call(fn, max_retries=1, backoff_sec=2.0):
     """Call fn(), retry once on transient API errors with exponential backoff.
 
@@ -137,30 +145,152 @@ def plan_searches(use_case: str, technology: str, industry: str) -> dict:
 
 # Function 2: conduct_research() - Execute searches
 @observe()
-def conduct_research(queries: list) -> str:
+def conduct_research(queries: list) -> dict:
     """
-    Execute searches and compile results.
-    
+    Execute searches and compile results into structured data.
+
+    Keeping structure (not just a flat string) lets the pipeline detect empty or
+    partial research (#29), surface sources in the report (#14), and measure research
+    adequacy (#7).
+
     Args:
         queries: List of search query strings
-        
+
     Returns:
-        Formatted string of all research findings
+        dict with keys:
+            findings_text (str): formatted research text for Claude (empty if nothing found)
+            sources (list[dict]): {"title", "url", "query"} for every result found
+            successful_queries (list[str]): queries that returned at least one result
+            failed_queries (list[str]): queries that returned nothing (search failed or empty)
+            num_results (int): total number of results across all queries
     """
     print("\n🔬 Conducting research...")
-    
-    all_results = []
-    
+
+    all_text = []
+    sources = []
+    successful_queries = []
+    failed_queries = []
+
     for query in queries:
         # Search using our tools.py function
         search_response = search_web(query, max_results=3)
         results = search_response.get('results', [])
-        
+
         if results:
-            all_results.append(f"\n=== Search: {query} ===")
-            all_results.append(format_search_results(results))
-    
-    return "\n".join(all_results)
+            successful_queries.append(query)
+            all_text.append(f"\n=== Search: {query} ===")
+            all_text.append(format_search_results(results))
+            for r in results:
+                sources.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("url", ""),
+                    "query": query,
+                })
+        else:
+            # Search failed or returned nothing — record it so the pipeline can react
+            failed_queries.append(query)
+
+    return {
+        "findings_text": "\n".join(all_text),
+        "sources": sources,
+        "successful_queries": successful_queries,
+        "failed_queries": failed_queries,
+        "num_results": len(sources),
+    }
+
+
+# ── Research adequacy (#7) ────────────────────────────────────────────────────
+# Below this many total results, research is considered "thin" and triggers ONE
+# broadened supplementary search round. A cheap heuristic, not an LLM-driven loop.
+MIN_ADEQUATE_RESULTS = 4
+
+
+def _broadened_queries(use_case: str, technology: str, industry: str) -> list:
+    """Generic, broad fallback queries for the #7 supplementary search round.
+
+    Deliberately broad so they are likely to return *something* even when the
+    AI-planned queries were too narrow, too specific, or mistyped.
+    """
+    return [
+        f"{industry} AI compliance regulations",
+        f"{technology} data privacy compliance",
+        f"AI regulation requirements {industry}",
+    ]
+
+
+def _merge_research(first: dict, second: dict) -> dict:
+    """Combine two conduct_research() results into one, de-duplicating sources by URL."""
+    seen_urls = {s["url"] for s in first["sources"] if s["url"]}
+    merged_sources = list(first["sources"])
+    for s in second["sources"]:
+        if s["url"] and s["url"] in seen_urls:
+            continue
+        seen_urls.add(s["url"])
+        merged_sources.append(s)
+
+    findings = "\n".join(
+        text for text in [first["findings_text"], second["findings_text"]] if text
+    )
+
+    return {
+        "findings_text": findings,
+        "sources": merged_sources,
+        "successful_queries": first["successful_queries"] + second["successful_queries"],
+        "failed_queries": first["failed_queries"] + second["failed_queries"],
+        "num_results": len(merged_sources),
+    }
+
+
+@observe()
+def gather_research(use_case: str, technology: str, industry: str, queries: list) -> dict:
+    """Run research once; if the first pass is thin, run ONE broadened round and merge.
+
+    This is the lightweight research-adequacy check (#7): a cheap heuristic, not an
+    LLM-driven agent loop. Callers use this instead of conduct_research() directly so
+    both the CLI and the Streamlit app get the same adequacy behaviour.
+
+    Returns the (possibly merged) research dict — same shape as conduct_research().
+    """
+    research = conduct_research(queries)
+
+    if research["num_results"] < MIN_ADEQUATE_RESULTS:
+        print(
+            f"\n🔁 Research looks thin ({research['num_results']} results) — "
+            "running one broadened search round…"
+        )
+        supplementary = conduct_research(_broadened_queries(use_case, technology, industry))
+        research = _merge_research(research, supplementary)
+
+    return research
+
+
+def score_research_quality(num_sources: int, research_limited: bool, num_failed_queries: int) -> None:
+    """Attach research-quality scores to the current Langfuse trace so runs are filterable.
+
+    Must be called from inside an @observe-decorated function (so a trace is active).
+    These become filterable/chartable "scores" in the Langfuse UI.
+
+    Two robustness details for the v4 SDK in a long-running Streamlit process:
+    - Scores are attached to the trace by its explicit id (create_score) rather than relying
+      on the ambient "current" context.
+    - flush() is called so the scores are sent immediately. Without it, scores sit buffered
+      until the process exits — which never happens in a live Streamlit app.
+
+    Fail-safe: any Langfuse error is swallowed so observability never breaks the pipeline.
+    """
+    try:
+        trace_id = langfuse.get_current_trace_id()
+        if not trace_id:
+            return
+        langfuse.create_score(name="num_sources", value=num_sources,
+                              trace_id=trace_id, data_type="NUMERIC")
+        langfuse.create_score(name="research_limited", value=1 if research_limited else 0,
+                              trace_id=trace_id, data_type="BOOLEAN")
+        langfuse.create_score(name="num_failed_queries", value=num_failed_queries,
+                              trace_id=trace_id, data_type="NUMERIC")
+        langfuse.flush()  # push scores out now; a live Streamlit app never shuts down to flush
+    except Exception as e:
+        print(f"⚠️ Langfuse research-quality scoring skipped: {e}")
 
 
 # Function 3: analyze_compliance() - Ask Claude to analyze
@@ -218,7 +348,7 @@ def analyze_compliance(use_case: str, technology: str, industry: str, research_f
 
 
 # Function 4: save_report() - Persist results to a file
-def save_report(result: dict, version: str = "v0.5", output_dir: str | None = None, run_id: str | None = None) -> str:
+def save_report(result: dict, version: str = "v0.6", output_dir: str | None = None, run_id: str | None = None) -> str:
     """
     Save the analysis report to a timestamped file named after the use case.
 
@@ -254,6 +384,15 @@ def save_report(result: dict, version: str = "v0.5", output_dir: str | None = No
 
     run_id_line = f"**Run ID:** `{run_id}`  \n" if run_id else ""
 
+    # Honest note when the report was built on thin research (#29)
+    limited_note = ""
+    if result.get("research_limited"):
+        limited_note = (
+            "> ⚠️ **Note:** This report was generated from limited research data. "
+            "Some searches returned few or no results, so coverage may be incomplete — "
+            "consider re-running the analysis.\n\n"
+        )
+
     header = (
         f"# Compliance Gap Analysis Report\n\n"
         f"**Version:** {version}  \n"
@@ -264,13 +403,29 @@ def save_report(result: dict, version: str = "v0.5", output_dir: str | None = No
         f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  \n"
         f"{timing_line}\n"
         f"---\n\n"
+        f"{limited_note}"
         f"## Search Queries Used\n\n"
     )
     queries_section = "\n".join(f"- {q}" for q in result['search_queries']) + "\n\n"
     body = f"---\n\n## Analysis\n\n{result['analysis']}\n"
 
+    # Sources section — shows where the research came from (#14)
+    sources = result.get("sources", [])
+    sources_section = ""
+    if sources:
+        lines = [
+            "\n---\n",
+            "## Sources\n",
+            "_Regulatory and policy sources the agent reviewed for this report._\n",
+        ]
+        for i, s in enumerate(sources, 1):
+            title = s.get("title") or s.get("url") or "Untitled source"
+            url = s.get("url", "")
+            lines.append(f"{i}. [{title}]({url})" if url else f"{i}. {title}")
+        sources_section = "\n".join(lines) + "\n"
+
     with open(filepath, "w", encoding="utf-8") as f:
-        f.write(header + queries_section + body)
+        f.write(header + queries_section + body + sources_section)
 
     print(f"\n💾 Report saved to: {filepath}")
     return filepath
@@ -278,7 +433,7 @@ def save_report(result: dict, version: str = "v0.5", output_dir: str | None = No
 
 # Function 5: run_analysis() - Orchestrate everything
 @observe()
-def run_analysis(use_case: str, technology: str, industry: str, version: str = "v0.5") -> dict:
+def run_analysis(use_case: str, technology: str, industry: str, version: str = "v0.6") -> dict:
     """
     Main function to run complete compliance gap analysis.
 
@@ -308,10 +463,27 @@ def run_analysis(use_case: str, technology: str, industry: str, version: str = "
     search_queries = plan_result["queries"]
     time_planning = time.time() - t0
 
-    # Step 2: Conduct research
+    # Step 2: Conduct research (with lightweight adequacy retry — #7)
     t0 = time.time()
-    research_findings = conduct_research(search_queries)
+    research = gather_research(use_case, technology, industry, search_queries)
+    research_findings = research["findings_text"]
     time_research = time.time() - t0
+
+    # #29 — refuse to write a report on top of empty research (it would be fabricated)
+    if research["num_results"] == 0:
+        print("\n❌ Research returned no results — aborting before analysis to avoid a fabricated report.")
+        return {
+            "error": (
+                "Research failed: no results were returned from any search. "
+                "This is usually a transient web-search issue — please try again."
+            )
+        }
+
+    # Partial research: enough to proceed, but thin enough to flag in the report (#29)
+    research_limited = 0 < research["num_results"] < MIN_ADEQUATE_RESULTS
+
+    # Record research-quality scores on the Langfuse trace so runs are filterable
+    score_research_quality(research["num_results"], research_limited, len(research["failed_queries"]))
 
     # Step 3: Analyze compliance (returns dict with analysis, thinking, tokens)
     t0 = time.time()
@@ -342,6 +514,8 @@ def run_analysis(use_case: str, technology: str, industry: str, version: str = "
         'industry': industry,
         'search_queries': search_queries,
         'analysis': analysis,
+        'sources': research["sources"],
+        'research_limited': research_limited,
         'timing': timing,
         'planning_thinking': plan_result.get("thinking"),
         'analysis_thinking': analysis_result.get("thinking"),
@@ -466,3 +640,13 @@ if __name__ == "__main__":
         print("COMPLIANCE ANALYSIS REPORT")
         print("="*60)
         print(result['analysis'])
+
+        # Also echo the sources here so the terminal view matches the saved report file.
+        sources = result.get('sources', [])
+        if sources:
+            print("\n" + "-"*60)
+            print(f"SOURCES ({len(sources)})")
+            print("-"*60)
+            for i, s in enumerate(sources, 1):
+                title = s.get('title') or s.get('url') or "Untitled source"
+                print(f"{i}. {title}\n   {s.get('url', '')}")
