@@ -33,6 +33,26 @@ MEDIUM: report quality heuristics, user feedback, token reduction, source inclus
 Deferred as planned: #30 (quality heuristics), #13 (research preprocessing), and LOW items
 (#8, #23, #24, #25, #32).
 
+### Added 2026-08-07 — currency, fine print, and delivery tooling
+
+- **Current date reaches both Claude calls** (`prompts.py`, `agent.py`): `SEARCH_PLANNING_PROMPT`
+  and `ANALYSIS_PROMPT` now receive today's date. The planner had been anchoring queries to its
+  training-era year — searching "…2024" for a report generated in August 2026 — and the analysis
+  had no way to tell whether a deadline had already passed. New `DATES & CURRENCY` rules instruct
+  the model to check every date against today, prefer newer dates when research shows one moved,
+  and stay vague rather than assert a date it cannot support. `_today()` resolves per call, so a
+  long-running Streamlit process cannot get stuck on its boot date
+- **Disclaimer on every report** (`prompts.py`, `agent.py`, `streamlit_app.py`): new
+  `REPORT_DISCLAIMER`, defined once and attached to the saved markdown, the on-screen report, the
+  download and the database copy. Also re-attached in the save-failure fallback, which previously
+  produced a report with no fine print
+- **Custom-run CLI** (`agent.py`): `--use-case` / `--technology` / `--industry` flags, so one-off
+  analyses run without adding real inputs to a file in a public repo
+- **`export_pdf.py`** (new): renders a saved report as print-ready HTML for Save-as-PDF. No new
+  dependencies by design. `--client-ready` drops the internal search-queries section
+- **`.gitignore`**: `reports/*.html` added so exported reports stay out of the repo;
+  `test-log.csv` untracked — performance logs are kept locally
+
 Full details: [docs/iterations/v0.6-pipeline-hardening-and-prompt-fixes.md](docs/iterations/v0.6-pipeline-hardening-and-prompt-fixes.md)
 
 ---
