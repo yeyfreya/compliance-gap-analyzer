@@ -57,6 +57,7 @@ from agent import (
     MIN_ADEQUATE_RESULTS,
     TEST_SCENARIOS,
 )
+from prompts import REPORT_DISCLAIMER
 from tracking import (
     init_session,
     start_run,
@@ -378,7 +379,9 @@ if run_btn:
             with open(report_path, "r", encoding="utf-8") as f:
                 report_md = f.read()
         else:
-            report_md = result.get("analysis", "")
+            # Local save failed — rebuild enough of the report by hand. The disclaimer is
+            # re-attached explicitly: no copy of a report leaves here without it.
+            report_md = result.get("analysis", "") + f"\n\n---\n\n{REPORT_DISCLAIMER}\n"
 
         if run_id:
             complete_run(run_id, result["timing"])
@@ -472,6 +475,8 @@ if result:
 
     with tab_report:
         st.markdown(result["analysis"])
+        st.divider()
+        st.caption(REPORT_DISCLAIMER)
 
     with tab_sources:
         sources = result.get("sources", [])

@@ -26,6 +26,8 @@ Be specific, ground your findings in the provided research, and focus on actiona
 
 # AI task 1 - Plan Research
 SEARCH_PLANNING_PROMPT = """
+TODAY'S DATE: {current_date}
+
 Given this AI implementation scenario:
 
 USE CASE: {use_case}
@@ -33,6 +35,12 @@ TECHNOLOGY: {technology}
 INDUSTRY: {industry}
 
 What 3-5 searches should I run to identify compliance requirements and vendor policies?
+
+IMPORTANT — anchor your searches to today's date above, not to the period your training
+data comes from. Regulations move fast, and a query aimed at the wrong year returns
+superseded rules. When a query benefits from a time anchor, use the current year from
+today's date, or words like "latest" / "current" / "in force". Never write a past year
+into a query unless you are deliberately researching that year's rule.
 
 After the JSON array, include a REASONING section explaining:
 - Why you chose each query (what regulatory gap or risk does it target?)
@@ -54,6 +62,8 @@ Focus on:
 
 # AI task 2 - Analyze Findings
 ANALYSIS_PROMPT = """
+TODAY'S DATE: {current_date}
+
 Based on the following information, analyze the compliance gaps:
 
 USE CASE: {use_case}
@@ -85,6 +95,22 @@ Critical tone rules:
   "regulators are actively focused on this area."
 - The goal is to make founders feel informed and empowered, not stressed or accused.
   They came here to quickly see their potential compliance gaps — deliver that clearly.
+
+## DATES & CURRENCY
+
+Treat TODAY'S DATE above as the present moment. Do NOT infer the current year from your
+training data — it is older than today, and regulatory timelines shift constantly.
+
+- Before naming any deadline or effective date, check it against today's date. Say whether
+  it has already passed, is imminent, or is still some way off.
+- Deadlines get deferred, amended and replaced. If the research findings suggest a date has
+  moved, use the newer one and note that it changed.
+- If you are not confident a date is still current — because the research is silent or the
+  sources look old — describe what the regulation requires without asserting a hard date,
+  and add that the timeline is worth confirming against the regulator's own guidance.
+  A vague-but-honest timeline is far better than a confident wrong one.
+- Prefer requirements you can tie to something in the research findings over ones you are
+  recalling from memory, since your memory of a regulation may predate its latest amendment.
 
 ## FORMAT — Follow this structure EXACTLY
 
@@ -159,5 +185,18 @@ to review first, and an encouraging closing note. No sub-headers.
 - Sub-groupings within sections use **bold text** — never sub-headers
 - Be specific and cite research findings, but stay concise
 - Total report length: aim for 150–250 lines of markdown"""
+
+
+# Fine print appended to every report — markdown, PDF and on-screen alike.
+#
+# ⚠️ This is a LEGAL surface, not just copy. It exists to keep the product positioned as a
+# tool: the customer stays responsible for their own legal decisions, always. Same reason the
+# voice rules above say "worth confirming" instead of "you don't have." Do not soften, shorten
+# or drop it without the founder's say-so.
+REPORT_DISCLAIMER = """**About this report.** This is an automated gap analysis produced by an AI agent from public
+web research. It highlights areas worth reviewing — it is not legal advice, and it does not
+establish or confirm your compliance position. Regulations change frequently and research
+coverage varies by topic; verify anything you act on against the primary source, and consult
+a qualified professional for decisions specific to your situation."""
 
 

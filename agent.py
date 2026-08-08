@@ -15,7 +15,7 @@ from langfuse import observe, get_client as get_langfuse_client
 from opentelemetry.instrumentation.anthropic import AnthropicInstrumentor
 
 from tools import search_web, format_search_results
-from prompts import SYSTEM_PROMPT, ANALYSIS_PROMPT, SEARCH_PLANNING_PROMPT
+from prompts import SYSTEM_PROMPT, ANALYSIS_PROMPT, SEARCH_PLANNING_PROMPT, REPORT_DISCLAIMER
 
 load_dotenv()
 
@@ -25,6 +25,17 @@ AnthropicInstrumentor().instrument()
 
 # Initialize Claude client
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+
+def _today() -> str:
+    """Today's date, written out for a prompt (e.g. "7 August 2026").
+
+    Both Claude calls need this. Without it the model falls back on its training-era sense
+    of "now": the planner searches for the wrong year, and the analysis repeats deadlines
+    that have since moved. Resolved per call, never cached, so a long-running Streamlit
+    process doesn't get stuck on the date it booted.
+    """
+    return datetime.now().strftime("%d %B %Y").lstrip("0")
 
 
 class EmptyResearchError(Exception):
@@ -76,6 +87,7 @@ def plan_searches(use_case: str, technology: str, industry: str) -> dict:
     print("\n📋 Planning research strategy...")
 
     prompt = SEARCH_PLANNING_PROMPT.format(
+        current_date=_today(),
         use_case=use_case,
         technology=technology,
         industry=industry
@@ -305,6 +317,7 @@ def analyze_compliance(use_case: str, technology: str, industry: str, research_f
     print("\n🧠 Analyzing compliance gaps...")
 
     prompt = ANALYSIS_PROMPT.format(
+        current_date=_today(),
         use_case=use_case,
         technology=technology,
         industry=industry,
@@ -424,8 +437,11 @@ def save_report(result: dict, version: str = "v0.6", output_dir: str | None = No
             lines.append(f"{i}. [{title}]({url})" if url else f"{i}. {title}")
         sources_section = "\n".join(lines) + "\n"
 
+    # Fine print — every report carries it, no exceptions (see REPORT_DISCLAIMER)
+    disclaimer_section = f"\n---\n\n{REPORT_DISCLAIMER}\n"
+
     with open(filepath, "w", encoding="utf-8") as f:
-        f.write(header + queries_section + body + sources_section)
+        f.write(header + queries_section + body + sources_section + disclaimer_section)
 
     print(f"\n💾 Report saved to: {filepath}")
     return filepath
@@ -620,18 +636,58 @@ TEST_SCENARIOS = {
     },
 }
 
+def _parse_cli_args(argv: list) -> dict:
+    """Resolve command-line arguments into a scenario dict for run_analysis().
+
+    Two ways to run:
+      python agent.py healthcare
+      python agent.py --use-case "…" --technology "…" --industry "…"
+
+    The second form exists so one-off analyses can be run without adding anyone's real
+    business details to this file — which lives in a public repo. Custom inputs stay in
+    the shell, not in source control.
+
+    Exits with usage text if the arguments don't form a complete scenario.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python agent.py",
+        description="Run a compliance gap analysis from a named scenario or custom inputs.",
+    )
+    parser.add_argument("scenario", nargs="?", choices=sorted(TEST_SCENARIOS),
+                        help="one of the built-in test scenarios")
+    parser.add_argument("--use-case", help="what the AI system does (custom run)")
+    parser.add_argument("--technology", help="the model or platform it runs on (custom run)")
+    parser.add_argument("--industry", help="the industry and jurisdiction (custom run)")
+    args = parser.parse_args(argv)
+
+    custom = {"use_case": args.use_case, "technology": args.technology, "industry": args.industry}
+    given = [name for name, value in custom.items() if value]
+
+    if args.scenario and given:
+        parser.error("use either a scenario name or the custom flags, not both")
+
+    if args.scenario:
+        return TEST_SCENARIOS[args.scenario]
+
+    if given:
+        missing = [name for name, value in custom.items() if not value]
+        if missing:
+            parser.error("a custom run needs all three: " + ", ".join(f"--{m.replace('_', '-')}" for m in missing))
+        return custom
+
+    parser.print_help()
+    print("\nAvailable scenarios:")
+    for key, s in TEST_SCENARIOS.items():
+        print(f"  {key:12s} -- {s['use_case']}")
+    raise SystemExit(1)
+
+
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) < 2 or sys.argv[1] not in TEST_SCENARIOS:
-        print("Usage: python agent.py <scenario>")
-        print("\nAvailable scenarios:")
-        for key, s in TEST_SCENARIOS.items():
-            print(f"  {key:12s} -- {s['use_case']}")
-        sys.exit(1)
-
-    scenario = TEST_SCENARIOS[sys.argv[1]]
-    result = run_analysis(**scenario)
+    result = run_analysis(**_parse_cli_args(sys.argv[1:]))
 
     if "error" in result:
         print(f"\n❌ {result['error']}")
