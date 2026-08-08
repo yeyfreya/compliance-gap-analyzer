@@ -282,7 +282,7 @@ reports/
 ├── report_fintech.md           # Showcase report (tracked in git)
 ├── report_regtech.md           # Showcase report (tracked in git)
 ├── report_v<VERSION>_*.md      # Auto-generated (gitignored)
-└── test-log.csv                # Performance log — always tracked, append-only
+└── test-log.csv                # Performance log — LOCAL ONLY, append-only (gitignored)
 ```
 
 ---
