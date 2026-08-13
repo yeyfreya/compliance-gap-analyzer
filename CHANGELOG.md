@@ -5,6 +5,70 @@ Each version represents an iteration, including what was analyzed, what changed,
 
 ---
 
+## [v0.7] - 2026-08-12 — Research Scoping & Source Tiering
+
+### Summary
+v0.6 fixed the pipeline's date defect and the reports got *worse* — knowing today's date let
+the model compare a stale research fact against the calendar and declare a deadline missed that
+had actually been deferred. The date was a symptom; source quality was the disease. v0.7
+replaces free-form search planning with a structured scoping stage, makes research prefer
+authoritative sources by construction, and has the report show its own assumptions and coverage.
+
+### What Changed
+- **New pipeline stage — `scope_analysis()`** (`agent.py`, `prompts.py`): a Claude call that
+  runs *before* any searching and maps the regulatory territory across five fixed dimensions
+  (jurisdiction, profession, data, activity, vendor). Returns structured JSON: `assumptions`
+  (each with its basis and what changes if it is wrong), `candidate_regimes` (each with a
+  status — likely applies / may apply / likely not applicable **with a checkable reason** —
+  and one targeted search query), and `official_domains` for that scenario. Replaces
+  `plan_searches()`, which invented 3–5 free-form queries with no coverage guarantee
+- **Two-tier research** (`agent.py` `gather_research()`, `tools.py`): one targeted search per
+  candidate regime instead of free-form queries, so coverage comes from the dimension list
+  rather than luck. Tier 1 restricts the search to `official_domains`; Tier 2 (unrestricted)
+  runs only where Tier 1 returned nothing. `search_web()` gains an `include_domains` parameter.
+  Every source carries its tier through to the report
+- **The report shows its own work** (`prompts.py`): two new sections — **Scope & Assumptions**
+  at the top (who the analysis assumed you are, and what changes if that is wrong) and
+  **Coverage** near the end (what was considered, what was ruled out *with reasoning*, and
+  which authoritative domains were actually searched). Existing sections renumber; the length
+  target moves from 150–250 to 180–280 lines so the gap analysis itself is not squeezed
+- **Source-tier rules in the analysis prompt** (`prompts.py`): findings arrive tagged Tier 1 or
+  Tier 2; any claim resting only on commentary must say so, and a quote attributed to an
+  authority must come from that authority's own domain
+- **No fallback on scoping failure** (`agent.py`): new `ScopingError`; one retry, then an honest
+  abort rather than silently reverting to the search planner that failed its accuracy test
+- **Observability extended** (`tracking.py`, `agent.py`, `streamlit_app.py`, `migrations/`): the
+  scoping step is its own Langfuse span; two new trace scores (candidate-regime count, share of
+  Tier 1 sources); `analysis_runs` gains `scoping_sec`, `num_candidate_regimes`,
+  `pct_tier1_sources`, and `scope_json` — the full scoping output per run, so cross-run
+  variation can be analyzed in SQL instead of by re-reading reports. SQL in `migrations/`
+- **UI** (`streamlit_app.py`): step 1 is now "Scoping your regulatory territory"; research
+  reports the share of official sources; the timing caption moves to "typically 2–3 minutes"
+
+### Test Results
+Three runs on one professional-services scenario, compared against a hand-verified answer key.
+
+**Fixed:** the governing professional body was found and cited to its own domain in 3/3 runs
+(v0.6 omitted it entirely in 2 of 6 runs). Vendor-policy contradictions between runs are gone —
+where v0.6 asserted three mutually incompatible data-retention claims across runs, v0.7
+consistently reports that the terms were not found and should be obtained directly. Every run
+states which product tier it assumed and what changes if that is wrong. Reasoned exclusions
+work: regimes ruled out now carry a checkable reason.
+
+**Not fixed:** the *set* of regulations is now stable across runs, but the **ranking** is not —
+which regime is called CRITICAL #1 still varies. And the tier system leaks: the search
+provider's domain filter is not strict, and a scoping call occasionally lists an
+official-looking commercial site as authoritative, so some commentary reaches the analysis
+carrying an official-source tag. One run repeated the v0.6 "deadline has passed" error from a
+leaked commentary source. Source quality remains the binding constraint. The fix is
+deterministic tier verification in code rather than trusting the search provider's filter;
+that is not yet implemented.
+
+**Timing:** ~165–180s per run, up from ~110s on v0.6 — one additional Claude call plus one
+search per candidate regime.
+
+---
+
 ## [v0.6] - 2026-03-10 — Pipeline Hardening & Prompt Fixes
 
 ### Summary

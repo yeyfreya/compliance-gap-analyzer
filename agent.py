@@ -15,7 +15,7 @@ from langfuse import observe, get_client as get_langfuse_client
 from opentelemetry.instrumentation.anthropic import AnthropicInstrumentor
 
 from tools import search_web, format_search_results
-from prompts import SYSTEM_PROMPT, ANALYSIS_PROMPT, SEARCH_PLANNING_PROMPT, REPORT_DISCLAIMER
+from prompts import SYSTEM_PROMPT, ANALYSIS_PROMPT, SCOPING_PROMPT, REPORT_DISCLAIMER
 
 load_dotenv()
 
@@ -44,6 +44,12 @@ class EmptyResearchError(Exception):
     Signals that we must NOT ask Claude to write a report, because a report built on
     no research would be fabricated (#29). Callers decide how to surface this.
     """
+
+
+class ScopingError(Exception):
+    """Raised when the scoping step fails to produce usable JSON after a retry.
+    The pipeline aborts honestly rather than falling back to the v0.6 planner,
+    which failed its accuracy test."""
 
 
 def _retry_api_call(fn, max_retries=1, backoff_sec=2.0):
@@ -75,140 +81,110 @@ def _retry_api_call(fn, max_retries=1, backoff_sec=2.0):
     raise last_exc
 
 
-# Function 1: plan_searches() - Ask Claude what to search
+# Function 1: scope_analysis() - Map the regulatory territory before any research runs
 @observe()
-def plan_searches(use_case: str, technology: str, industry: str) -> dict:
+def scope_analysis(use_case: str, technology: str, industry: str) -> dict:
     """
-    Ask Claude to plan what searches to run, with extended thinking enabled.
+    Ask Claude to map the regulatory territory across five fixed dimensions
+    (jurisdiction, profession, data, activity, vendor), with extended thinking enabled.
+    Runs BEFORE any research — its output drives gather_research()'s tiered, per-regime
+    searches. Replaces v0.6's free-form plan_searches().
 
     Returns:
-        dict with keys: queries (list[str]), thinking (str), tokens_in (int), tokens_out (int)
-    """
-    print("\n📋 Planning research strategy...")
+        dict with keys: scope (dict), thinking (str), tokens_in (int), tokens_out (int)
 
-    prompt = SEARCH_PLANNING_PROMPT.format(
+    Raises:
+        ScopingError: if the API call itself errors, or scoping still fails to produce
+        usable JSON after one retry. There is NO fallback path here — a report built on
+        a guessed scope is exactly the failure mode that sank v0.6's planner.
+    """
+    print("\n🧭 Scoping regulatory territory...")
+
+    prompt = SCOPING_PROMPT.format(
         current_date=_today(),
         use_case=use_case,
         technology=technology,
         industry=industry
     )
 
-    try:
-        response = _retry_api_call(lambda: client.messages.create(
+    def _call():
+        return client.messages.create(
             model="claude-sonnet-4-5-20250929",
-            max_tokens=5000,
+            max_tokens=6000,
             thinking={"type": "enabled", "budget_tokens": 3000},
             system=SYSTEM_PROMPT,
             messages=[
                 {"role": "user", "content": prompt}
             ]
-        ))
+        )
+
+    def _extract(response):
+        thinking_text = ""
+        response_text = ""
+        for block in response.content:
+            if block.type == "thinking":
+                thinking_text = block.thinking
+            elif block.type == "text":
+                response_text = block.text
+        return thinking_text, response_text
+
+    def _parse(response_text: str) -> dict:
+        start = response_text.find('{')
+        end = response_text.rfind('}') + 1
+        parsed = json.loads(response_text[start:end])
+        if not isinstance(parsed.get("candidate_regimes"), list) or not parsed["candidate_regimes"]:
+            raise ValueError("candidate_regimes missing or empty")
+        if not isinstance(parsed.get("official_domains"), list):
+            raise ValueError("official_domains missing or not a list")
+        return parsed
+
+    try:
+        response = _retry_api_call(_call)
     except anthropic.APIError as e:
-        print(f"⚠️ Claude API error during search planning: {e}")
-        return {
-            "queries": [
-                f"{industry} AI regulations compliance",
-                f"{technology} data retention policy",
-                f"{technology} GDPR compliance"
-            ],
-            "thinking": None,
-            "tokens_in": 0,
-            "tokens_out": 0,
-            "error": f"plan_searches API error: {e}",
-        }
+        raise ScopingError(f"Claude API error during scoping: {e}") from e
 
-    thinking_text = ""
-    response_text = ""
-    for block in response.content:
-        if block.type == "thinking":
-            thinking_text = block.thinking
-        elif block.type == "text":
-            response_text = block.text
-
+    thinking_text, response_text = _extract(response)
     tokens_in = response.usage.input_tokens
     tokens_out = response.usage.output_tokens
 
     try:
-        start = response_text.find('[')
-        end = response_text.rfind(']') + 1
-        json_str = response_text[start:end]
-        queries = json.loads(json_str)
+        scope = _parse(response_text)
+    except (json.JSONDecodeError, ValueError, IndexError) as first_err:
+        print(f"⚠️ Couldn't parse scoping output ({first_err}), retrying once...")
+        try:
+            response = _retry_api_call(_call)
+        except anthropic.APIError as e:
+            raise ScopingError(f"Claude API error during scoping retry: {e}") from e
 
-        print(f"✅ Planned {len(queries)} searches")
-        return {
-            "queries": queries,
-            "thinking": thinking_text,
-            "tokens_in": tokens_in,
-            "tokens_out": tokens_out,
-        }
-    except (json.JSONDecodeError, ValueError, IndexError):
-        print("⚠️ Couldn't parse search plan, using defaults")
-        return {
-            "queries": [
-                f"{industry} AI regulations compliance",
-                f"{technology} data retention policy",
-                f"{technology} GDPR compliance"
-            ],
-            "thinking": thinking_text,
-            "tokens_in": tokens_in,
-            "tokens_out": tokens_out,
-        }
+        thinking_text, response_text = _extract(response)
+        tokens_in = response.usage.input_tokens
+        tokens_out = response.usage.output_tokens
 
+        try:
+            scope = _parse(response_text)
+        except (json.JSONDecodeError, ValueError, IndexError) as second_err:
+            raise ScopingError(
+                f"Scoping failed to produce usable JSON after retry: {second_err}"
+            ) from second_err
 
-# Function 2: conduct_research() - Execute searches
-@observe()
-def conduct_research(queries: list) -> dict:
-    """
-    Execute searches and compile results into structured data.
-
-    Keeping structure (not just a flat string) lets the pipeline detect empty or
-    partial research (#29), surface sources in the report (#14), and measure research
-    adequacy (#7).
-
-    Args:
-        queries: List of search query strings
-
-    Returns:
-        dict with keys:
-            findings_text (str): formatted research text for Claude (empty if nothing found)
-            sources (list[dict]): {"title", "url", "query"} for every result found
-            successful_queries (list[str]): queries that returned at least one result
-            failed_queries (list[str]): queries that returned nothing (search failed or empty)
-            num_results (int): total number of results across all queries
-    """
-    print("\n🔬 Conducting research...")
-
-    all_text = []
-    sources = []
-    successful_queries = []
-    failed_queries = []
-
-    for query in queries:
-        # Search using our tools.py function
-        search_response = search_web(query, max_results=3)
-        results = search_response.get('results', [])
-
-        if results:
-            successful_queries.append(query)
-            all_text.append(f"\n=== Search: {query} ===")
-            all_text.append(format_search_results(results))
-            for r in results:
-                sources.append({
-                    "title": r.get("title", ""),
-                    "url": r.get("url", ""),
-                    "query": query,
-                })
-        else:
-            # Search failed or returned nothing — record it so the pipeline can react
-            failed_queries.append(query)
-
+    print(f"✅ Scoped {len(scope['candidate_regimes'])} candidate regulations")
     return {
-        "findings_text": "\n".join(all_text),
-        "sources": sources,
-        "successful_queries": successful_queries,
-        "failed_queries": failed_queries,
-        "num_results": len(sources),
+        "scope": scope,
+        "thinking": thinking_text,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
     }
+
+
+# ── Source tiering (v0.7) ────────────────────────────────────────────────────
+# Tier 1 = the authority's own domain (regulator, standards body, vendor docs) — search
+# restricted to scope["official_domains"]. Tier 2 = the unrestricted fallback used only
+# when Tier 1 comes back empty. Every source the pipeline surfaces carries a tier tag so
+# ANALYSIS_PROMPT can weight claims accordingly (see prompts.py "SOURCE TIERS").
+def _tag_tier(formatted_block: str, tier: int) -> str:
+    """Prefix each result block in a format_search_results() string with its tier tag."""
+    tag = "[TIER 1 — official source]" if tier == 1 else "[TIER 2 — commentary]"
+    return re.sub(r'--- Result (\d+) ---', rf'--- Result \1 {tag} ---', formatted_block)
 
 
 # ── Research adequacy (#7) ────────────────────────────────────────────────────
@@ -221,7 +197,7 @@ def _broadened_queries(use_case: str, technology: str, industry: str) -> list:
     """Generic, broad fallback queries for the #7 supplementary search round.
 
     Deliberately broad so they are likely to return *something* even when the
-    AI-planned queries were too narrow, too specific, or mistyped.
+    scoped regime queries were too narrow, too specific, or mistyped.
     """
     return [
         f"{industry} AI compliance regulations",
@@ -230,8 +206,54 @@ def _broadened_queries(use_case: str, technology: str, industry: str) -> list:
     ]
 
 
+def _run_broadened_round(use_case: str, technology: str, industry: str) -> dict:
+    """Supplementary, unrestricted search round for #7 (thin research).
+
+    Bypasses the tiered, per-regime scoping entirely, so every result is tagged
+    tier 2 / regime "general" — same result shape as gather_research().
+    """
+    all_text = []
+    sources = []
+    successful_queries = []
+    failed_queries = []
+    executed_queries = []
+
+    for query in _broadened_queries(use_case, technology, industry):
+        executed_queries.append(query)
+        search_response = search_web(query, max_results=3)
+        results = search_response.get('results', [])
+
+        if results:
+            successful_queries.append(query)
+            all_text.append("\n=== Rulebook: general (status: supplementary) ===")
+            all_text.append(_tag_tier(format_search_results(results), 2))
+            for r in results:
+                sources.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("url", ""),
+                    "query": query,
+                    "tier": 2,
+                    "regime": "general",
+                })
+        else:
+            failed_queries.append(query)
+
+    return {
+        "findings_text": "\n".join(all_text),
+        "sources": sources,
+        "successful_queries": successful_queries,
+        "failed_queries": failed_queries,
+        "executed_queries": executed_queries,
+        "num_results": len(sources),
+        "tier1_count": 0,
+        "tier2_count": len(sources),
+        "regimes_searched": [],
+        "domains_searched": [],
+    }
+
+
 def _merge_research(first: dict, second: dict) -> dict:
-    """Combine two conduct_research() results into one, de-duplicating sources by URL."""
+    """Combine two gather_research()-shaped results into one, de-duplicating sources by URL."""
     seen_urls = {s["url"] for s in first["sources"] if s["url"]}
     merged_sources = list(first["sources"])
     for s in second["sources"]:
@@ -249,34 +271,130 @@ def _merge_research(first: dict, second: dict) -> dict:
         "sources": merged_sources,
         "successful_queries": first["successful_queries"] + second["successful_queries"],
         "failed_queries": first["failed_queries"] + second["failed_queries"],
+        "executed_queries": first.get("executed_queries", []) + second.get("executed_queries", []),
         "num_results": len(merged_sources),
+        "tier1_count": first.get("tier1_count", 0) + second.get("tier1_count", 0),
+        "tier2_count": first.get("tier2_count", 0) + second.get("tier2_count", 0),
+        "regimes_searched": first.get("regimes_searched", []) + second.get("regimes_searched", []),
+        "domains_searched": first.get("domains_searched", []),
     }
 
 
+# Function 2: gather_research() - Tiered, per-regime search driven by the scoping output
 @observe()
-def gather_research(use_case: str, technology: str, industry: str, queries: list) -> dict:
-    """Run research once; if the first pass is thin, run ONE broadened round and merge.
-
-    This is the lightweight research-adequacy check (#7): a cheap heuristic, not an
-    LLM-driven agent loop. Callers use this instead of conduct_research() directly so
-    both the CLI and the Streamlit app get the same adequacy behaviour.
-
-    Returns the (possibly merged) research dict — same shape as conduct_research().
+def gather_research(use_case: str, technology: str, industry: str, scope: dict) -> dict:
     """
-    research = conduct_research(queries)
+    Run tiered research for each candidate regime from scope_analysis().
+
+    For every regime marked "likely_applies" or "may_apply" (excluded regimes still
+    reach the report via the scoping data itself, not via research): Tier 1 searches
+    scope["official_domains"] only; if that returns nothing, Tier 2 falls back to an
+    unrestricted search. If the combined results are still thin, runs ONE broadened
+    supplementary round (#7) and merges it in.
+
+    Args:
+        scope: the dict returned by scope_analysis()["scope"]
+
+    Returns:
+        dict with keys:
+            findings_text (str): formatted research text for Claude, tier-tagged per result
+            sources (list[dict]): {"title", "url", "query", "tier", "regime"} per result
+            successful_queries (list[str]): queries that returned at least one result
+            failed_queries (list[str]): queries where both tiers returned nothing
+            executed_queries (list[str]): every query actually run, in order
+            num_results (int): total number of results across all regimes
+            tier1_count (int): results that came from an official-domain-restricted search
+            tier2_count (int): results that came from an unrestricted fallback search
+            regimes_searched (list[str]): regime names actually searched
+            domains_searched (list[str]): official_domains actually passed to Tier 1
+    """
+    print("\n🔬 Conducting tiered research...")
+
+    regimes = scope.get("candidate_regimes", [])[:8]
+    searchable = [r for r in regimes if r.get("status") in ("likely_applies", "may_apply")]
+    official_domains = scope.get("official_domains", [])
+
+    all_text = []
+    sources = []
+    successful_queries = []
+    failed_queries = []
+    executed_queries = []
+    regimes_searched = []
+    tier1_count = 0
+    tier2_count = 0
+
+    for regime in searchable:
+        query = regime.get("search_query", "")
+        name = regime.get("name", "Unnamed regulation")
+        status = regime.get("status", "")
+        if not query:
+            continue
+
+        executed_queries.append(query)
+        regimes_searched.append(name)
+
+        tier1_response = search_web(query, max_results=3, include_domains=official_domains)
+        tier1_results = tier1_response.get('results', [])
+
+        if tier1_results:
+            tier = 1
+            results = tier1_results
+        else:
+            tier2_response = search_web(query, max_results=3)
+            results = tier2_response.get('results', [])
+            tier = 2
+
+        if results:
+            successful_queries.append(query)
+            all_text.append(f"\n=== Rulebook: {name} (status: {status}) ===")
+            all_text.append(_tag_tier(format_search_results(results), tier))
+            for r in results:
+                sources.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("url", ""),
+                    "query": query,
+                    "tier": tier,
+                    "regime": name,
+                })
+            if tier == 1:
+                tier1_count += len(results)
+            else:
+                tier2_count += len(results)
+        else:
+            # Both tiers came back empty — record it so the pipeline can react
+            failed_queries.append(query)
+
+    research = {
+        "findings_text": "\n".join(all_text),
+        "sources": sources,
+        "successful_queries": successful_queries,
+        "failed_queries": failed_queries,
+        "executed_queries": executed_queries,
+        "num_results": len(sources),
+        "tier1_count": tier1_count,
+        "tier2_count": tier2_count,
+        "regimes_searched": regimes_searched,
+        "domains_searched": official_domains,
+    }
 
     if research["num_results"] < MIN_ADEQUATE_RESULTS:
         print(
             f"\n🔁 Research looks thin ({research['num_results']} results) — "
             "running one broadened search round…"
         )
-        supplementary = conduct_research(_broadened_queries(use_case, technology, industry))
+        supplementary = _run_broadened_round(use_case, technology, industry)
         research = _merge_research(research, supplementary)
 
     return research
 
 
-def score_research_quality(num_sources: int, research_limited: bool, num_failed_queries: int) -> None:
+def score_research_quality(
+    num_sources: int,
+    research_limited: bool,
+    num_failed_queries: int,
+    num_candidate_regimes: int,
+    pct_tier1_sources: float,
+) -> None:
     """Attach research-quality scores to the current Langfuse trace so runs are filterable.
 
     Must be called from inside an @observe-decorated function (so a trace is active).
@@ -287,6 +405,10 @@ def score_research_quality(num_sources: int, research_limited: bool, num_failed_
       on the ambient "current" context.
     - flush() is called so the scores are sent immediately. Without it, scores sit buffered
       until the process exits — which never happens in a live Streamlit app.
+
+    Args:
+        num_candidate_regimes: how many regulations/standards scope_analysis() surfaced
+        pct_tier1_sources: fraction (0–1) of sources that came from an official domain
 
     Fail-safe: any Langfuse error is swallowed so observability never breaks the pipeline.
     """
@@ -300,6 +422,10 @@ def score_research_quality(num_sources: int, research_limited: bool, num_failed_
                               trace_id=trace_id, data_type="BOOLEAN")
         langfuse.create_score(name="num_failed_queries", value=num_failed_queries,
                               trace_id=trace_id, data_type="NUMERIC")
+        langfuse.create_score(name="num_candidate_regimes", value=num_candidate_regimes,
+                              trace_id=trace_id, data_type="NUMERIC")
+        langfuse.create_score(name="pct_tier1_sources", value=pct_tier1_sources,
+                              trace_id=trace_id, data_type="NUMERIC")
         langfuse.flush()  # push scores out now; a live Streamlit app never shuts down to flush
     except Exception as e:
         print(f"⚠️ Langfuse research-quality scoring skipped: {e}")
@@ -307,20 +433,42 @@ def score_research_quality(num_sources: int, research_limited: bool, num_failed_
 
 # Function 3: analyze_compliance() - Ask Claude to analyze
 @observe()
-def analyze_compliance(use_case: str, technology: str, industry: str, research_findings: str) -> dict:
+def analyze_compliance(
+    use_case: str,
+    technology: str,
+    industry: str,
+    research_findings: str,
+    scope: dict,
+    domains_searched: list,
+) -> dict:
     """
-    Analyze compliance gaps based on research, with extended thinking enabled.
+    Analyze compliance gaps based on tiered research and the earlier scoping output,
+    with extended thinking enabled.
+
+    Args:
+        scope: the dict returned by scope_analysis()["scope"] — carries assumptions and
+            candidate_regimes so the report can show its own scoping honestly
+        domains_searched: the official_domains actually passed to Tier 1 searches, so the
+            report's "Official sources searched" line is truthful, never invented
 
     Returns:
         dict with keys: analysis (str), thinking (str), tokens_in (int), tokens_out (int)
     """
     print("\n🧠 Analyzing compliance gaps...")
 
+    scoping_context = json.dumps({
+        "assumptions": scope.get("assumptions", []),
+        "candidate_regimes": scope.get("candidate_regimes", []),
+    }, indent=2)
+    official_domains_searched = "\n".join(f"- {d}" for d in domains_searched) or "(none)"
+
     prompt = ANALYSIS_PROMPT.format(
         current_date=_today(),
         use_case=use_case,
         technology=technology,
         industry=industry,
+        scoping_context=scoping_context,
+        official_domains_searched=official_domains_searched,
         research_findings=research_findings
     )
 
@@ -361,7 +509,7 @@ def analyze_compliance(use_case: str, technology: str, industry: str, research_f
 
 
 # Function 4: save_report() - Persist results to a file
-def save_report(result: dict, version: str = "v0.6", output_dir: str | None = None, run_id: str | None = None) -> str:
+def save_report(result: dict, version: str = "v0.7", output_dir: str | None = None, run_id: str | None = None) -> str:
     """
     Save the analysis report to a timestamped file named after the use case.
 
@@ -390,7 +538,7 @@ def save_report(result: dict, version: str = "v0.6", output_dir: str | None = No
     if timing:
         timing_line = (
             f"**Generation Time:** {timing['total_sec']}s total "
-            f"(planning: {timing['planning_sec']}s, "
+            f"(scoping: {timing['scoping_sec']}s, "
             f"research: {timing['research_sec']}s, "
             f"analysis: {timing['analysis_sec']}s)  \n"
         )
@@ -434,7 +582,13 @@ def save_report(result: dict, version: str = "v0.6", output_dir: str | None = No
         for i, s in enumerate(sources, 1):
             title = s.get("title") or s.get("url") or "Untitled source"
             url = s.get("url", "")
-            lines.append(f"{i}. [{title}]({url})" if url else f"{i}. {title}")
+            line = f"{i}. [{title}]({url})" if url else f"{i}. {title}"
+            tier = s.get("tier")
+            if tier == 1:
+                line += " — official source"
+            elif tier == 2:
+                line += " — commentary"
+            lines.append(line)
         sources_section = "\n".join(lines) + "\n"
 
     # Fine print — every report carries it, no exceptions (see REPORT_DISCLAIMER)
@@ -449,12 +603,13 @@ def save_report(result: dict, version: str = "v0.6", output_dir: str | None = No
 
 # Function 5: run_analysis() - Orchestrate everything
 @observe()
-def run_analysis(use_case: str, technology: str, industry: str, version: str = "v0.6") -> dict:
+def run_analysis(use_case: str, technology: str, industry: str, version: str = "v0.7") -> dict:
     """
     Main function to run complete compliance gap analysis.
 
     Returns dict with: use_case, technology, industry, search_queries, analysis,
-    timing, planning_thinking, analysis_thinking, token_usage.
+    timing, scoping_thinking, analysis_thinking, token_usage, scope, tier1_count,
+    tier2_count, domains_searched.
     """
     inputs = {"use_case": use_case, "technology": technology, "industry": industry}
     for field, value in inputs.items():
@@ -473,17 +628,25 @@ def run_analysis(use_case: str, technology: str, industry: str, version: str = "
 
     total_start = time.time()
 
-    # Step 1: Plan searches (returns dict with queries, thinking, tokens)
+    # Step 1: Scope the regulatory territory (returns dict with scope, thinking, tokens)
     t0 = time.time()
-    plan_result = plan_searches(use_case, technology, industry)
-    search_queries = plan_result["queries"]
-    time_planning = time.time() - t0
+    try:
+        scope_result = scope_analysis(use_case, technology, industry)
+    except ScopingError as e:
+        print(f"\n❌ Scoping failed — aborting before research. {e}")
+        return {"error": f"Scoping failed: {e}. Please try again."}
+    scope = scope_result["scope"]
+    time_scoping = time.time() - t0
 
-    # Step 2: Conduct research (with lightweight adequacy retry — #7)
+    # Step 2: Gather tiered, per-regime research (with lightweight adequacy retry — #7)
     t0 = time.time()
-    research = gather_research(use_case, technology, industry, search_queries)
+    research = gather_research(use_case, technology, industry, scope)
     research_findings = research["findings_text"]
     time_research = time.time() - t0
+
+    search_queries = research.get(
+        "executed_queries", research["successful_queries"] + research["failed_queries"]
+    )
 
     # #29 — refuse to write a report on top of empty research (it would be fabricated)
     if research["num_results"] == 0:
@@ -499,18 +662,24 @@ def run_analysis(use_case: str, technology: str, industry: str, version: str = "
     research_limited = 0 < research["num_results"] < MIN_ADEQUATE_RESULTS
 
     # Record research-quality scores on the Langfuse trace so runs are filterable
-    score_research_quality(research["num_results"], research_limited, len(research["failed_queries"]))
+    pct_tier1_sources = research["tier1_count"] / max(research["num_results"], 1)
+    score_research_quality(
+        research["num_results"], research_limited, len(research["failed_queries"]),
+        len(scope.get("candidate_regimes", [])), pct_tier1_sources,
+    )
 
     # Step 3: Analyze compliance (returns dict with analysis, thinking, tokens)
     t0 = time.time()
-    analysis_result = analyze_compliance(use_case, technology, industry, research_findings)
+    analysis_result = analyze_compliance(
+        use_case, technology, industry, research_findings, scope, research["domains_searched"]
+    )
     analysis = analysis_result["analysis"]
     time_analysis = time.time() - t0
 
     time_total = time.time() - total_start
 
     timing = {
-        'planning_sec': round(time_planning, 1),
+        'scoping_sec': round(time_scoping, 1),
         'research_sec': round(time_research, 1),
         'analysis_sec': round(time_analysis, 1),
         'total_sec': round(time_total, 1),
@@ -519,7 +688,7 @@ def run_analysis(use_case: str, technology: str, industry: str, version: str = "
     print("\n" + "="*60)
     print("✅ ANALYSIS COMPLETE")
     print(f"⏱️  Total: {timing['total_sec']}s "
-          f"(plan: {timing['planning_sec']}s, "
+          f"(scoping: {timing['scoping_sec']}s, "
           f"research: {timing['research_sec']}s, "
           f"analysis: {timing['analysis_sec']}s)")
     print("="*60)
@@ -533,12 +702,16 @@ def run_analysis(use_case: str, technology: str, industry: str, version: str = "
         'sources': research["sources"],
         'research_limited': research_limited,
         'timing': timing,
-        'planning_thinking': plan_result.get("thinking"),
+        'scoping_thinking': scope_result.get("thinking"),
         'analysis_thinking': analysis_result.get("thinking"),
         'token_usage': {
-            'planning': {'input': plan_result.get("tokens_in", 0), 'output': plan_result.get("tokens_out", 0)},
+            'scoping': {'input': scope_result.get("tokens_in", 0), 'output': scope_result.get("tokens_out", 0)},
             'analysis': {'input': analysis_result.get("tokens_in", 0), 'output': analysis_result.get("tokens_out", 0)},
         },
+        'scope': scope,
+        'tier1_count': research["tier1_count"],
+        'tier2_count': research["tier2_count"],
+        'domains_searched': research["domains_searched"],
     }
 
     report_path = save_report(result, version=version)
@@ -550,7 +723,7 @@ def run_analysis(use_case: str, technology: str, industry: str, version: str = "
 
 _TEST_LOG_FIELDS = [
     'timestamp', 'version', 'run_id', 'use_case', 'technology', 'industry',
-    'num_queries', 'planning_sec', 'research_sec', 'analysis_sec', 'total_sec',
+    'num_queries', 'scoping_sec', 'planning_sec', 'research_sec', 'analysis_sec', 'total_sec',
     'report_file',
 ]
 
@@ -570,7 +743,8 @@ def append_test_log(result: dict, version: str, report_path: str, run_id: str | 
         'technology': result['technology'],
         'industry': result['industry'],
         'num_queries': len(result.get('search_queries', [])),
-        'planning_sec': timing.get('planning_sec', ''),
+        'scoping_sec': timing.get('scoping_sec', ''),
+        'planning_sec': '',  # v0.6 column, kept for old-row compatibility — v0.7 runs leave it empty
         'research_sec': timing.get('research_sec', ''),
         'analysis_sec': timing.get('analysis_sec', ''),
         'total_sec': timing.get('total_sec', ''),
@@ -580,7 +754,7 @@ def append_test_log(result: dict, version: str, report_path: str, run_id: str | 
     if os.path.exists(log_path):
         with open(log_path, 'r', encoding='utf-8') as f:
             existing_header = f.readline().strip().split(',')
-        if 'run_id' not in existing_header:
+        if existing_header != _TEST_LOG_FIELDS:
             _migrate_csv_header(log_path)
 
     file_exists = os.path.exists(log_path)
@@ -594,7 +768,9 @@ def append_test_log(result: dict, version: str, report_path: str, run_id: str | 
 
 
 def _migrate_csv_header(log_path: str) -> None:
-    """One-time migration: add run_id column to existing test-log.csv."""
+    """Migration: bring an existing test-log.csv header up to date with _TEST_LOG_FIELDS,
+    filling any newly added columns with '' on old rows (started as a run_id-only add,
+    generalized in v0.7 for scoping_sec)."""
     with open(log_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         old_rows = list(reader)
@@ -603,7 +779,8 @@ def _migrate_csv_header(log_path: str) -> None:
         writer = csv.DictWriter(f, fieldnames=_TEST_LOG_FIELDS, extrasaction='ignore')
         writer.writeheader()
         for old_row in old_rows:
-            old_row.setdefault('run_id', '')
+            for field in _TEST_LOG_FIELDS:
+                old_row.setdefault(field, '')
             writer.writerow(old_row)
 
 
