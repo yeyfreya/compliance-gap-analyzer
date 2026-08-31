@@ -22,7 +22,7 @@ ENV/
 # IDE
 .vscode/
 .idea/
-.cursor/*
+.cursor/
 !.cursor/rules/
 *.swp
 *.swo
@@ -33,15 +33,17 @@ ENV/
 Thumbs.db
 desktop.ini
 
-# Chat transcripts (kept locally, not published)
-docs/dev-logs/transcripts/
-
-# Dev logs (session-level notes — kept locally, iteration docs are the public story)
-docs/dev-logs/
-
-# Local-only reference docs
+# Local only
+application/
 docs/DOCUMENTATION-SYSTEM-MAP.md
 docs/PROJECT-SCHEMA.md
+docs/ROADMAP.md
+docs/SESSION-WORKFLOW.md
+docs/business/
+docs/dev-logs/
+docs/feedback/
+docs/learning/
+marketing/
 
 # Scratch test files (v0.1 API smoke tests — not real tests)
 test_all.py
@@ -50,8 +52,10 @@ test_tavily.py
 
 # Reports — keep locally, only showcase examples are tracked
 reports/report_*.md
+reports/*.html
 reports/test_report.md
 reports/test_correlation_report.md
+reports/test-log.csv
 !reports/report_healthcare.md
 !reports/report_regtech.md
 !reports/report_fintech.md

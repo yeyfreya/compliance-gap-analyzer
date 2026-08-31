@@ -108,7 +108,8 @@ def complete_run(
     """Update an analysis run with final timing and status."""
     update = {
         "status": status,
-        "planning_sec": timing.get("planning_sec"),
+        "scoping_sec": timing.get("scoping_sec"),
+        "planning_sec": timing.get("planning_sec"),  # v0.6 column; None for v0.7 runs
         "research_sec": timing.get("research_sec"),
         "analysis_sec": timing.get("analysis_sec"),
         "total_sec": timing.get("total_sec"),
@@ -118,6 +119,39 @@ def complete_run(
         update["error_message"] = error_message
 
     _supabase_client.from_("analysis_runs").update(update).eq("id", run_id).execute()
+
+
+@_safe
+def update_run_research_quality(
+    run_id: str,
+    num_sources: int,
+    research_limited: bool,
+    num_failed_queries: int,
+    num_candidate_regimes: int,
+    pct_tier1_sources: float,
+) -> None:
+    """Save research-quality metrics onto the run row so they are queryable in SQL.
+
+    Kept as a SEPARATE update from complete_run() on purpose: if the new columns don't
+    exist yet (schema not migrated), only this call fails — timing/status stay intact.
+    Requires columns num_sources, research_limited, num_failed_queries,
+    num_candidate_regimes, pct_tier1_sources on analysis_runs.
+    """
+    _supabase_client.from_("analysis_runs").update({
+        "num_sources": num_sources,
+        "research_limited": research_limited,
+        "num_failed_queries": num_failed_queries,
+        "num_candidate_regimes": num_candidate_regimes,
+        "pct_tier1_sources": pct_tier1_sources,
+    }).eq("id", run_id).execute()
+
+
+@_safe
+def update_run_scope(run_id: str, scope: dict) -> None:
+    """Store the scoping output on the run row (column scope_json, jsonb)."""
+    _supabase_client.from_("analysis_runs").update({
+        "scope_json": json.dumps(scope)
+    }).eq("id", run_id).execute()
 
 
 # ── User event tracking ──────────────────────────────────────────────────────

@@ -15,6 +15,7 @@ import os
 import time
 from tavily import TavilyClient
 from dotenv import load_dotenv
+from langfuse import observe  # records each search as its own step in Langfuse
 
 # Load environment variables
 load_dotenv()
@@ -25,29 +26,37 @@ tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
 
 #search_web() - Use Tavily to search the web for information
-def search_web(query: str, max_results: int = 3) -> dict:
+@observe()
+def search_web(query: str, max_results: int = 3, include_domains: list[str] | None = None) -> dict:
     """
     Search the web for compliance-related information.
-    
+
     Args:
         query: Search query string (e.g., "HIPAA requirements for AI")
         max_results: Maximum number of results to return (default: 3)
-        
+        include_domains: Optional list of domains to restrict the search to (v0.7 —
+            Tier 1 official-source-first search). When falsy, omitted from the Tavily
+            call entirely, so unrestricted callers see no behavior change.
+
     Returns:
         Dictionary with 'results' list, or 'error' key if search fails
     """
-    
+
     last_error = None
     for attempt in range(2):
         try:
             print(f"\n🔍 Searching: {query}")
 
-            response = tavily.search(
-                query=query, 
-                max_results=max_results,
-                search_depth="advanced"
-                )
-            
+            search_kwargs = {
+                "query": query,
+                "max_results": max_results,
+                "search_depth": "advanced",
+            }
+            if include_domains:
+                search_kwargs["include_domains"] = include_domains
+
+            response = tavily.search(**search_kwargs)
+
             results = []
             for result in response.get('results', []):
                 results.append({

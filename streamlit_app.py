@@ -47,17 +47,24 @@ from langfuse import observe, get_client as get_langfuse_client
 from opentelemetry import trace as otel_trace
 
 from agent import (
-    plan_searches,
-    conduct_research,
+    scope_analysis,
+    gather_research,
     analyze_compliance,
     save_report,
     append_test_log,
+    score_research_quality,
+    EmptyResearchError,
+    ScopingError,
+    MIN_ADEQUATE_RESULTS,
     TEST_SCENARIOS,
 )
+from prompts import REPORT_DISCLAIMER
 from tracking import (
     init_session,
     start_run,
     complete_run,
+    update_run_research_quality,
+    update_run_scope,
     log_user_event,
     save_report_to_db,
     log_error,
@@ -65,7 +72,7 @@ from tracking import (
     is_rate_limited,
 )
 
-VERSION = "v0.5"
+VERSION = "v0.7"
 _langfuse = get_langfuse_client()
 
 st.set_page_config(
@@ -171,7 +178,7 @@ with st.sidebar:
 
     st.divider()
     st.caption(
-        f"{VERSION} · Built with Claude + Tavily · "
+        f"{VERSION} · AI agent with live regulatory research · "
         "[GitHub](https://github.com/yeyfreya/ai-compliance-gap-analyzer)"
     )
 
@@ -193,7 +200,7 @@ st.markdown(
 def _run_pipeline(use_case, technology, industry, run_id, session_id, version):
     """Run the full analysis pipeline under a single Langfuse parent trace.
 
-    All child @observe() functions (plan_searches, conduct_research,
+    All child @observe() functions (scope_analysis, gather_research,
     analyze_compliance) are automatically nested as spans under this trace.
     """
     span = otel_trace.get_current_span()
@@ -224,7 +231,7 @@ def _run_pipeline(use_case, technology, industry, run_id, session_id, version):
                         <span style="font-variant-numeric:tabular-nums; font-weight:600;"
                               id="elapsed">0:00</span>
                         <span style="opacity:0.55; font-size:0.88rem;">
-                            · Usually about a minute · may take longer for complex or region-specific cases
+                            · Typically 2–3 minutes · may take longer for complex or region-specific cases
                         </span>
                     </div>
                     <script>
@@ -241,22 +248,47 @@ def _run_pipeline(use_case, technology, industry, run_id, session_id, version):
                     height=40,
                 )
 
-            # Step 1 — Plan searches
-            st.write("📋 **Planning research strategy** — identifying key regulations to investigate…")
+            # Step 1 — Scope the regulatory territory
+            st.write(
+                "🧭 **Scoping your regulatory territory** — identifying which "
+                "jurisdictions, professional bodies, and data rules apply to your case…"
+            )
             t0 = time.time()
-            plan_result = plan_searches(use_case, technology, industry)
-            search_queries = plan_result["queries"]
-            time_planning = round(time.time() - t0, 1)
-            st.write(f"✅ Planned **{len(search_queries)}** search queries ({time_planning}s)")
+            scope_result = scope_analysis(use_case, technology, industry)
+            scope = scope_result["scope"]
+            time_scoping = round(time.time() - t0, 1)
+            n_regimes = len(scope.get("candidate_regimes", []))
+            st.write(f"✅ Scoped **{n_regimes}** regulations & standards to investigate ({time_scoping}s)")
+            update_run_scope(run_id, scope)
 
             status.update(label="Running compliance analysis… (step 2/3)")
 
-            # Step 2 — Conduct research
+            # Step 2 — Conduct tiered research (with lightweight adequacy retry — #7)
             st.write("🔬 **Conducting research** — searching the web for regulatory data…")
             t0 = time.time()
-            research_findings = conduct_research(search_queries)
+            research = gather_research(use_case, technology, industry, scope)
+            research_findings = research["findings_text"]
             time_research = round(time.time() - t0, 1)
-            st.write(f"✅ Research complete ({time_research}s)")
+
+            # #29 — refuse to generate a report from empty research
+            if research["num_results"] == 0:
+                status.update(label="Research unavailable", state="error", expanded=True)
+                raise EmptyResearchError("No research results were returned from any search.")
+
+            research_limited = 0 < research["num_results"] < MIN_ADEQUATE_RESULTS
+            pct_tier1_sources = research["tier1_count"] / max(research["num_results"], 1)
+            limited_tag = " · limited data" if research_limited else ""
+            st.write(
+                f"✅ Research complete — {research['num_results']} sources "
+                f"({round(pct_tier1_sources * 100)}% from official sources) "
+                f"({time_research}s){limited_tag}"
+            )
+
+            # Record research-quality scores on this run's Langfuse trace (filterable)
+            score_research_quality(
+                research["num_results"], research_limited, len(research["failed_queries"]),
+                n_regimes, pct_tier1_sources,
+            )
 
             status.update(label="Running compliance analysis… (step 3/3)")
 
@@ -266,7 +298,9 @@ def _run_pipeline(use_case, technology, industry, run_id, session_id, version):
                 "and writing your report. This is the longest step…"
             )
             t0 = time.time()
-            analysis_result = analyze_compliance(use_case, technology, industry, research_findings)
+            analysis_result = analyze_compliance(
+                use_case, technology, industry, research_findings, scope, research["domains_searched"]
+            )
             analysis = analysis_result["analysis"]
             time_analysis = round(time.time() - t0, 1)
             st.write(f"✅ Analysis complete ({time_analysis}s)")
@@ -281,20 +315,31 @@ def _run_pipeline(use_case, technology, industry, run_id, session_id, version):
         "use_case": use_case,
         "technology": technology,
         "industry": industry,
-        "search_queries": search_queries,
+        "search_queries": research.get(
+            "executed_queries", research["successful_queries"] + research["failed_queries"]
+        ),
         "analysis": analysis,
+        "sources": research["sources"],
+        "research_limited": research_limited,
+        "num_failed_queries": len(research["failed_queries"]),
         "timing": {
-            "planning_sec": time_planning,
+            "scoping_sec": time_scoping,
             "research_sec": time_research,
             "analysis_sec": time_analysis,
             "total_sec": time_total,
         },
-        "planning_thinking": plan_result.get("thinking"),
+        "scoping_thinking": scope_result.get("thinking"),
         "analysis_thinking": analysis_result.get("thinking"),
         "token_usage": {
-            "planning": {"input": plan_result.get("tokens_in", 0), "output": plan_result.get("tokens_out", 0)},
+            "scoping": {"input": scope_result.get("tokens_in", 0), "output": scope_result.get("tokens_out", 0)},
             "analysis": {"input": analysis_result.get("tokens_in", 0), "output": analysis_result.get("tokens_out", 0)},
         },
+        "scope": scope,
+        "tier1_count": research["tier1_count"],
+        "tier2_count": research["tier2_count"],
+        "domains_searched": research["domains_searched"],
+        "num_candidate_regimes": n_regimes,
+        "pct_tier1_sources": pct_tier1_sources,
         "langfuse_trace_id": langfuse_trace_id,
     }
 
@@ -326,6 +371,7 @@ if run_btn:
     st.session_state.result = None
     st.session_state.report_md = None
     st.session_state.report_path = None
+    st.session_state.feedback_given = False
 
     scenario_source = chosen_key if chosen_key else "custom"
     run_id = start_run(session_id, use_case, technology, industry, scenario_source, VERSION)
@@ -346,22 +392,67 @@ if run_btn:
                       app_version=VERSION)
             report_path = None
 
+        # Build the FULL report markdown (includes the Sources section) once, up front,
+        # so both Supabase and the download button get the complete report — not just the
+        # analysis text. Falls back to the analysis if the local file save failed.
+        if report_path:
+            with open(report_path, "r", encoding="utf-8") as f:
+                report_md = f.read()
+        else:
+            # Local save failed — rebuild enough of the report by hand. The disclaimer is
+            # re-attached explicitly: no copy of a report leaves here without it.
+            report_md = result.get("analysis", "") + f"\n\n---\n\n{REPORT_DISCLAIMER}\n"
+
         if run_id:
             complete_run(run_id, result["timing"])
+            update_run_research_quality(
+                run_id,
+                len(result.get("sources", [])),
+                result.get("research_limited", False),
+                result.get("num_failed_queries", 0),
+                result.get("num_candidate_regimes", 0),
+                result.get("pct_tier1_sources", 0),
+            )
             if report_path:
-                save_report_to_db(run_id, result["analysis"], result["search_queries"],
+                save_report_to_db(run_id, report_md, result["search_queries"],
                                   os.path.basename(report_path))
             log_user_event(session_id, "report_viewed", run_id=run_id)
 
         st.session_state.result = result
         st.session_state.report_path = report_path
         st.session_state.current_run_id = run_id
+        st.session_state.report_md = report_md
 
-        if report_path:
-            with open(report_path, "r", encoding="utf-8") as f:
-                st.session_state.report_md = f.read()
-        else:
-            st.session_state.report_md = result.get("analysis", "")
+    except ScopingError as scoping_err:
+        # The scoping step couldn't produce a usable regulatory map — no fallback path,
+        # so we abort honestly rather than research/report against a guessed scope.
+        log_error(scoping_err, session_id=session_id, run_id=run_id,
+                  pipeline_step="scoping", user_inputs=_user_inputs,
+                  app_version=VERSION)
+        if run_id:
+            mark_run_failed(run_id, scoping_err)
+
+        st.warning(
+            "The analysis couldn't map your regulatory scope just now — this is "
+            "usually transient. Please try again."
+        )
+        st.caption(f"Reference: `{run_id or 'no-run-id'}`")
+        log_user_event(session_id, "scoping_failed", run_id=run_id)
+
+    except EmptyResearchError as research_err:
+        # #29 — research came back empty; we deliberately did NOT fabricate a report
+        log_error(research_err, session_id=session_id, run_id=run_id,
+                  pipeline_step="research", user_inputs=_user_inputs,
+                  app_version=VERSION)
+        if run_id:
+            mark_run_failed(run_id, research_err)
+
+        st.warning(
+            "The agent couldn't gather regulatory research just now — this is usually a "
+            "temporary web-search hiccup. Please try again in a moment."
+        )
+        st.caption(f"Reference: `{run_id or 'no-run-id'}`")
+        log_user_event(session_id, "research_failed", run_id=run_id)
 
     except Exception as pipeline_err:
         log_error(pipeline_err, session_id=session_id, run_id=run_id,
@@ -394,8 +485,8 @@ if result:
                 <div class="value">{timing['total_sec']}s</div>
             </div>
             <div class="metric-card">
-                <div class="label">Planning</div>
-                <div class="value">{timing['planning_sec']}s</div>
+                <div class="label">Scoping</div>
+                <div class="value">{timing['scoping_sec']}s</div>
             </div>
             <div class="metric-card">
                 <div class="label">Research</div>
@@ -410,10 +501,31 @@ if result:
         unsafe_allow_html=True,
     )
 
-    tab_report, tab_queries = st.tabs(["📄 Report", "🔍 Search Queries"])
+    if result.get("research_limited"):
+        st.warning(
+            "This report was generated from limited research data — some searches returned "
+            "few results. Coverage may be incomplete; consider re-running for a fuller analysis."
+        )
+
+    tab_report, tab_sources, tab_queries = st.tabs(
+        ["📄 Report", "🔗 Sources", "🔍 Search Queries"]
+    )
 
     with tab_report:
         st.markdown(result["analysis"])
+        st.divider()
+        st.caption(REPORT_DISCLAIMER)
+
+    with tab_sources:
+        sources = result.get("sources", [])
+        if sources:
+            st.caption("Regulatory and policy sources the agent reviewed for this report.")
+            for i, s in enumerate(sources, 1):
+                title = s.get("title") or s.get("url") or "Untitled source"
+                url = s.get("url", "")
+                st.markdown(f"{i}. [{title}]({url})" if url else f"{i}. {title}")
+        else:
+            st.caption("No sources were captured for this report.")
 
     with tab_queries:
         for i, q in enumerate(result["search_queries"], 1):
@@ -441,6 +553,27 @@ if result:
     with col_path:
         if not st.session_state.report_path:
             st.caption("⚠️ Local save failed — report available via download only")
+
+    # ── Feedback (#31) ────────────────────────────────────────────────────────
+    st.divider()
+    run_id_for_fb = st.session_state.get("current_run_id")
+    if st.session_state.get("feedback_given"):
+        st.caption("✅ Thanks for your feedback — it helps improve the agent.")
+    else:
+        st.markdown("**Was this report helpful?**")
+        fb_yes, fb_no, _ = st.columns([1, 1, 6])
+        with fb_yes:
+            if st.button("👍 Yes", use_container_width=True):
+                log_user_event(st.session_state.supabase_session_id, "feedback",
+                               run_id=run_id_for_fb, event_data={"rating": "up"})
+                st.session_state.feedback_given = True
+                st.rerun()
+        with fb_no:
+            if st.button("👎 No", use_container_width=True):
+                log_user_event(st.session_state.supabase_session_id, "feedback",
+                               run_id=run_id_for_fb, event_data={"rating": "down"})
+                st.session_state.feedback_given = True
+                st.rerun()
 
 elif not run_btn:
     st.info(

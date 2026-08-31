@@ -155,7 +155,7 @@ When a new version significantly improves report quality, replace the showcase r
 ### Rules
 - Never delete old reports locally — they document what each code version produced
 - **Most reports are gitignored** (`reports/report_*.md` in `.gitignore`). Showcase reports are un-ignored with `!` lines
-- `test-log.csv` is always tracked (not gitignored)
+- `test-log.csv` is **gitignored** — performance logs are kept locally. It is still append-only and never deleted
 
 ---
 
